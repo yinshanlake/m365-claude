@@ -1,0 +1,132 @@
+diff --git a/docs/m365-copilot-api.md b/docs/m365-copilot-api.md
+index b2d976a..452ef78 100644
+--- a/docs/m365-copilot-api.md
++++ b/docs/m365-copilot-api.md
+@@ -450,6 +450,13 @@ conversation at `1/600`). Characterised behaviour:
+ 
+ ## 8. Conversations & sessions
+ 
++The OpenAI-compatible endpoint accepts an optional opaque session identifier in
++the request's standard user field. SessionPool includes it in the conversation
++fingerprint, preventing separate CLI sessions with identical opening messages
++and tool sets from sharing M365 state. Clients that omit it retain the legacy
++opener/tool-set behavior. The Claude Code adapter hashes its client session
++metadata before supplying this field.
++
+ - A "conversation" = a stable `ConversationId` (+ `X-SessionId`). M365 keeps **server-side context** for it.
+ - Each **turn opens a fresh WebSocket** (with `invocationId:"0"`), but reuses the same `ConversationId`/`sessionId`, so the server threads them together. `isStartOfSession:true` only on turn 0.
+ - **Send `X-RoutingParameter-SessionKey: <ConversationId>` as a header on every upgrade.** Without it the front end spreads a conversation's connections over backends in two regions (`x-calculatedbetarget` in the upgrade response names the one you got), which keep separate copies of the conversation: the turns fork, the server's `turnCount` steps back (1,2,3,2,4,…), and the model answers from a partial history. The query-string form does not pin. See hypotheses §32 F85 and `scripts/fork-probe.mjs`.
+diff --git a/packages/proxy-lib/src/handler.ts b/packages/proxy-lib/src/handler.ts
+index f387c51..1f9278f 100644
+--- a/packages/proxy-lib/src/handler.ts
++++ b/packages/proxy-lib/src/handler.ts
+@@ -1,3 +1,4 @@
++import { createHash } from "node:crypto";
+ import {
+   ModelSession,
+   type ModelSessionOptions,
+@@ -200,12 +201,12 @@ export class SessionPool {
+   /**
+    * Resolve the conversation state for an incoming request.
+    * Fingerprint is the hash of the first user message and the request's tool
+-   * names — same opener and same tool set = same conversation.
++   * names, scoped to an optional client session identifier.
+    */
+-  resolve(messages: ParsedMessage[], tools?: ChatBody["tools"]): ConversationState {
++  resolve(messages: ParsedMessage[], tools?: ChatBody["tools"], clientSessionId?: string): ConversationState {
+     this.evictStale();
+ 
+-    const fingerprint = this.fingerprint(messages, tools);
++    const fingerprint = this.fingerprint(messages, tools, clientSessionId);
+     const existing = this.conversations.get(fingerprint);
+ 
+     if (existing) {
+@@ -252,10 +253,17 @@ export class SessionPool {
+   // which costs a thread, not the answer. Names, not definitions: descriptions
+   // can carry per-turn text. The system prompt would separate the title request
+   // too, but it is the likelier place for a date, a time or a git status.
+-  private fingerprint(messages: ParsedMessage[], tools?: ChatBody["tools"]): string {
++  private fingerprint(messages: ParsedMessage[], tools?: ChatBody["tools"], clientSessionId?: string): string {
+     const firstUser = messages.find(m => m.role === "user");
+     const text = firstUser ? getMessageContent(firstUser) : "";
+     const toolNames = [...new Set((tools ?? []).map(t => t.function.name))].sort().join(",");
++    if (clientSessionId) {
++      // Identical openers in independent CLI sessions must never share state.
++      // Hash the identifier so conversation logs do not reveal caller metadata.
++      return createHash("sha256")
++        .update(JSON.stringify([clientSessionId, toolNames, text]))
++        .digest("hex");
++    }
+     return simpleHash(`${toolNames}\n${text}`);
+   }
+ 
+@@ -347,7 +355,7 @@ export async function handleChatCompletion(
+   pool: SessionPool,
+   opts: { signal?: AbortSignal } = {},
+ ): Promise<Response> {
+-  const conv = pool.resolve(body.messages, body.tools);
++  const conv = pool.resolve(body.messages, body.tools, body.user);
+   const { session } = conv;
+   const hasTools = body.tools && body.tools.length > 0 && body.tool_choice !== "none";
+   const requestedModel = body.model;
+diff --git a/packages/proxy-lib/src/schemas.test.ts b/packages/proxy-lib/src/schemas.test.ts
+index 4e60c31..634117d 100644
+--- a/packages/proxy-lib/src/schemas.test.ts
++++ b/packages/proxy-lib/src/schemas.test.ts
+@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
+ import { ChatMessage, ChatCompletionRequest } from "./schemas";
+ 
+ describe("ChatMessage role normalization", () => {
++  it("preserves an optional opaque client session identifier", () => {
++    const request = ChatCompletionRequest.parse({
++      user: "opaque-session-key",
++      messages: [{ role: "user", content: "Inspect this project." }],
++    });
++    expect(request.user).toBe("opaque-session-key");
++  });
++
+   it("normalizes the OpenAI `developer` role to `system`", () => {
+     const msg = ChatMessage.parse({ role: "developer", content: "you are a bot" });
+     expect(msg.role).toBe("system");
+diff --git a/packages/proxy-lib/src/schemas.ts b/packages/proxy-lib/src/schemas.ts
+index eb13fb9..9962cb5 100644
+--- a/packages/proxy-lib/src/schemas.ts
++++ b/packages/proxy-lib/src/schemas.ts
+@@ -52,6 +52,8 @@ export const ChatCompletionRequest = z.object({
+   // high-variance at turn-1 tool-calling (see docs/hypotheses.md F24 + correction:
+   // magic swung 0/2 → 2/2 across probes; explicit tones pin a specific backend).
+   model: z.string().optional().default("gpt-5.5-think-deeper"),
++  // An opaque client session ID isolates otherwise identical conversation openers.
++  user: z.string().max(256).optional(),
+   messages: z.array(ChatMessage).min(1),
+   stream: z.boolean().optional().default(false),
+   // OpenAI streaming option: include_usage=true → emit a final chunk with `usage`.
+diff --git a/packages/proxy-lib/src/streaming.test.ts b/packages/proxy-lib/src/streaming.test.ts
+index c355bb2..c08f8e0 100644
+--- a/packages/proxy-lib/src/streaming.test.ts
++++ b/packages/proxy-lib/src/streaming.test.ts
+@@ -758,6 +758,24 @@ describe("follow-up turns and give-ups (Windows / pi, measured)", () => {
+ });
+ 
+ describe("a new harness session that shares the first user message", () => {
++  it("isolates growing histories from different explicit client sessions", () => {
++    const pool = new SessionPool();
++    const opener = [{ role: "user" as const, content: "Inspect this project." }];
++    const first = pool.resolve(opener, undefined, "client-one");
++    first.sentMessageCount = 1;
++    const longer = [...opener, { role: "user" as const, content: "Continue." }];
++    const second = pool.resolve(longer, undefined, "client-two");
++    expect(second).not.toBe(first);
++    expect(pool.resolve(longer, undefined, "client-one")).toBe(first);
++    expect(pool.size).toBe(2);
++  });
++
++  it("keeps unscoped clients separate from an explicitly scoped session", () => {
++    const pool = new SessionPool();
++    const opener = [{ role: "user" as const, content: "Inspect this project." }];
++    expect(pool.resolve(opener)).not.toBe(pool.resolve(opener, undefined, "client-one"));
++  });
++
+   const tools = [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } }];
+   const ask = async (messages: any[], pool: InstanceType<typeof SessionPool>) =>
+     (await (await handleChatCompletion(ChatCompletionRequest.parse({ model: "gpt-5.6-think-deeper", stream: false, tools, messages }), pool)).json()).choices[0].message;

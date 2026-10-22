@@ -1,0 +1,6 @@
+.local/
+runtime/
+node_modules/
+M365-Copilot2API/
+m365-copilot-proxy/
+*.log
